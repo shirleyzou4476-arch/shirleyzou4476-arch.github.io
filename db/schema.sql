@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS exceptions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   resolved_at TIMESTAMPTZ
 );
+ALTER TABLE exceptions ADD COLUMN IF NOT EXISTS warehouse_date DATE;
+ALTER TABLE exceptions ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE exceptions ADD COLUMN IF NOT EXISTS device_id TEXT;
 
 -- Permanent physical slots. This is deliberately not configurable: DockFlow has
 -- exactly 50 numbered sorting locations for every warehouse.
@@ -90,6 +93,12 @@ CREATE TABLE IF NOT EXISTS scan_events (
 );
 CREATE INDEX IF NOT EXISTS scan_events_time_idx ON scan_events(scanned_at DESC);
 CREATE INDEX IF NOT EXISTS scan_events_search_idx ON scan_events(box_id,sku);
+CREATE INDEX IF NOT EXISTS scan_events_archive_date_idx
+  ON scan_events(warehouse_date, scanned_at DESC);
+CREATE INDEX IF NOT EXISTS scan_events_archive_inbound_idx
+  ON scan_events(inbound_id);
+CREATE INDEX IF NOT EXISTS exceptions_archive_date_idx
+  ON exceptions(warehouse_date, created_at DESC);
 
 -- Idempotent migration for databases created by the earlier fixed-location build.
 ALTER TABLE scan_events ADD COLUMN IF NOT EXISTS location_number INTEGER;

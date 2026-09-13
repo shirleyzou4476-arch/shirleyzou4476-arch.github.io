@@ -13,6 +13,14 @@ const body=async req=>{let raw='';for await(const chunk of req)raw+=chunk;try{re
 const requireDb=res=>{if(!pool){json(res,503,{error:'DATABASE_URL is required for this API'});return false}return true};
 const warehouseDate=()=>new Intl.DateTimeFormat('en-CA',{timeZone:process.env.WAREHOUSE_TIME_ZONE||'America/Chicago',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 const query=(sql,params)=>pool.query(sql,params);
+const csvCell=value=>`"${String(value??'').replaceAll('"','""')}"`;
+const archiveDate=value=>/^\d{4}-\d{2}-\d{2}$/.test(value||'')?value:null;
+const archiveFilters=(params,startIndex=1)=>{
+  const values=[];const clauses=[];
+  const add=(column,value)=>{if(value){values.push(value);clauses.push(`${column} ILIKE '%'||$${startIndex+values.length-1}||'%'`)}};
+  add('s.sku',params.get('sku'));add('s.box_id',params.get('boxId'));add('s.inbound_id',params.get('inbound'));add('s.client_id',params.get('client'));add('s.location_number::text',params.get('location'));add('s.user_id',params.get('user'));add('s.device_id',params.get('device'));
+  return {clauses,values};
+};
 
 async function openCycle(client,date,user='system'){
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:${date}`]);
@@ -44,8 +52,31 @@ const server=http.createServer(async(req,res)=>{
     if(path==='/api/assignments'&&req.method==='GET'){
       const date=warehouseDate();const {rows}=await query(`SELECT da.location_number AS location,da.sku,da.capacity,COALESCE(SUM(s.qty),0)::int AS filled,da.assigned_at AS "assignedAt" FROM daily_assignments da JOIN daily_cycles dc ON dc.id=da.cycle_id LEFT JOIN scan_events s ON s.cycle_id=da.cycle_id AND s.location_number=da.location_number WHERE dc.warehouse_date=$1 AND dc.status='open' GROUP BY da.id ORDER BY da.location_number`,[date]);return json(res,200,rows)
     }
+    if(path==='/api/archive'&&req.method==='GET'){
+      const from=archiveDate(url.searchParams.get('from')||url.searchParams.get('date')),to=archiveDate(url.searchParams.get('to')||from);
+      if(!from||!to||from>to)return json(res,400,{error:'from and to must be valid YYYY-MM-DD dates'});
+      const {clauses,values}=archiveFilters(url.searchParams,3);const where=`s.warehouse_date BETWEEN $1 AND $2${clauses.length?' AND '+clauses.join(' AND '):''}`;
+      const {rows}=await query(`SELECT s.warehouse_date AS "warehouseDate",COUNT(*)::int AS "scannedBoxes",COALESCE(SUM(s.qty),0)::int AS units,COUNT(DISTINCT s.sku)::int AS skus,COUNT(DISTINCT s.location_number)::int AS locations,COUNT(DISTINCT s.user_id)::int AS users,COUNT(DISTINCT s.device_id)::int AS devices FROM scan_events s WHERE ${where} GROUP BY s.warehouse_date ORDER BY s.warehouse_date DESC`,[from,to,...values]);return json(res,200,rows)
+    }
+    if(path==='/api/archive/export'&&req.method==='GET'){
+      const from=archiveDate(url.searchParams.get('from')),to=archiveDate(url.searchParams.get('to'));
+      if(!from||!to||from>to)return json(res,400,{error:'from and to must be valid YYYY-MM-DD dates'});
+      const {clauses,values}=archiveFilters(url.searchParams,3);const where=`s.warehouse_date BETWEEN $1 AND $2${clauses.length?' AND '+clauses.join(' AND '):''}`;
+      const {rows}=await query(`SELECT s.warehouse_date AS date,s.box_id AS "boxId",s.sku,p.name,s.qty,s.location_number AS location,s.inbound_id AS "inboundId",s.client_id AS client,s.user_id AS "userId",s.device_id AS "deviceId",s.scanned_at AS "scannedAt" FROM scan_events s JOIN products p USING(sku) WHERE ${where} ORDER BY s.warehouse_date DESC,s.scanned_at DESC`,[from,to,...values]);
+      const header=['Date','Box ID','SKU','Product','Quantity','Location','Inbound','Client','User','Device','Scanned At'];const lines=[header,...rows.map(r=>[r.date,r.boxId,r.sku,r.name,r.qty,r.location?`LOCATION ${r.location}`:'',r.inboundId,r.client,r.userId,r.deviceId,r.scannedAt])].map(row=>row.map(csvCell).join(','));
+      res.writeHead(200,{'content-type':'text/csv; charset=utf-8','content-disposition':`attachment; filename="dockflow-${from}-to-${to}.csv"`});return res.end(lines.join('\n'))
+    }
+    const archiveDayMatch=path.match(/^\/api\/archive\/(\d{4}-\d{2}-\d{2})(?:\/(csv))?$/);
+    if(archiveDayMatch&&req.method==='GET'){
+      const date=archiveDate(archiveDayMatch[1]);const {clauses,values}=archiveFilters(url.searchParams,2);const where=`s.warehouse_date=$1${clauses.length?' AND '+clauses.join(' AND '):''}`;
+      const {rows}=await query(`SELECT s.box_id AS "boxId",s.sku,p.name,s.qty,s.location_number AS location,s.inbound_id AS "inboundId",s.client_id AS client,s.user_id AS "userId",s.device_id AS "deviceId",s.scanned_at AS "scannedAt" FROM scan_events s JOIN products p USING(sku) WHERE ${where} ORDER BY s.scanned_at DESC`,[date,...values]);
+      const exceptions=(await query(`SELECT e.id,e.box_id AS "boxId",e.reason,e.status,e.user_id AS "userId",e.device_id AS "deviceId",e.created_at AS "createdAt" FROM exceptions e WHERE e.warehouse_date=$1 OR (e.warehouse_date IS NULL AND e.box_id IN (SELECT box_id FROM scan_events WHERE warehouse_date=$1)) ORDER BY e.created_at DESC`,[date])).rows;
+      if(archiveDayMatch[2]){const header=['Date','Box ID','SKU','Product','Quantity','Location','Inbound','Client','User','Device','Scanned At'];const lines=[header,...rows.map(r=>[date,r.boxId,r.sku,r.name,r.qty,r.location?`LOCATION ${r.location}`:'',r.inboundId,r.client,r.userId,r.deviceId,r.scannedAt])].map(row=>row.map(csvCell).join(','));res.writeHead(200,{'content-type':'text/csv; charset=utf-8','content-disposition':`attachment; filename="dockflow-${date}.csv"`});return res.end(lines.join('\n'))}
+      const totals={scannedBoxes:rows.length,units:rows.reduce((n,r)=>n+r.qty,0),skus:new Set(rows.map(r=>r.sku)).size,locations:new Set(rows.map(r=>r.location).filter(Boolean)).size,users:new Set(rows.map(r=>r.userId)).size,devices:new Set(rows.map(r=>r.deviceId)).size};
+      return json(res,200,{date,totals,assignments:rows,exceptions})
+    }
     if(path==='/api/history'&&req.method==='GET'){const q=(url.searchParams.get('q')||'').trim();const {rows}=await query(`SELECT s.box_id AS "boxId",s.sku,s.qty,s.location_number AS loc,s.warehouse_date AS "warehouseDate",s.user_id AS "userId",s.device_id AS "deviceId",s.scanned_at AS "scannedAt",p.name FROM scan_events s JOIN products p USING(sku) WHERE ($1='' OR s.box_id ILIKE '%'||$1||'%' OR s.sku ILIKE '%'||$1||'%') ORDER BY s.scanned_at DESC LIMIT 200`,[q]);return json(res,200,rows)}
-    if(path==='/api/exceptions'&&req.method==='GET'){const {rows}=await query(`SELECT id,box_id AS box,reason,status,resolved_at AS "resolvedAt" FROM exceptions ORDER BY (status='open') DESC,created_at DESC`);return json(res,200,rows)}
+    if(path==='/api/exceptions'&&req.method==='GET'){const {rows}=await query(`SELECT id,box_id AS box,reason,status,warehouse_date AS "warehouseDate",resolved_at AS "resolvedAt" FROM exceptions ORDER BY (status='open') DESC,created_at DESC`);return json(res,200,rows)}
     const exceptionMatch=path.match(/^\/api\/exceptions\/([^/]+)\/resolve$/);if(exceptionMatch&&req.method==='POST'){const {rows}=await query(`UPDATE exceptions SET status='resolved',resolved_at=now() WHERE id=$1 RETURNING id,box_id AS box,reason,status,resolved_at AS "resolvedAt"`,[exceptionMatch[1]]);return rows[0]?json(res,200,rows[0]):json(res,404,{error:'Exception not found'})}
     if(path==='/api/scans'&&req.method==='POST'){
       const input=await body(req);if(!input)return json(res,400,{error:'Invalid JSON'});const boxId=String(input.boxId||'').trim().toUpperCase();if(!boxId)return json(res,400,{error:'boxId is required'});
@@ -59,7 +90,7 @@ const server=http.createServer(async(req,res)=>{
         for(const candidate of skuAssignments){const filled=Number((await client.query(`SELECT COALESCE(SUM(qty),0)::int AS filled FROM scan_events WHERE cycle_id=$1 AND location_number=$2`,[cycle.id,candidate.location_number])).rows[0].filled);if(filled+box.quantity<=candidate.capacity){assignment=candidate;break}}
         if(!assignment){
           const next=(await client.query(`SELECT sl.* FROM sorting_locations sl WHERE NOT EXISTS (SELECT 1 FROM daily_assignments da WHERE da.cycle_id=$1 AND da.location_number=sl.location_number) ORDER BY sl.location_number LIMIT 1 FOR UPDATE`,[cycle.id])).rows[0];
-          if(!next){await client.query(`INSERT INTO exceptions(box_id,reason) VALUES($1,$2)`,[boxId,'NO AVAILABLE SORTING LOCATION']);await client.query('COMMIT');return json(res,409,{error:'NO AVAILABLE SORTING LOCATION',exception:true})}
+          if(!next){await client.query(`INSERT INTO exceptions(box_id,reason,warehouse_date,user_id,device_id) VALUES($1,$2,$3,$4,$5)`,[boxId,'NO AVAILABLE SORTING LOCATION',date,input.userId||'unknown',input.deviceId||'unknown']);await client.query('COMMIT');return json(res,409,{error:'NO AVAILABLE SORTING LOCATION',exception:true})}
           assignment=(await client.query(`INSERT INTO daily_assignments(cycle_id,warehouse_date,sku,location_number,capacity,assigned_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[cycle.id,date,box.sku,next.location_number,next.capacity,input.userId||'system'])).rows[0];
         }
         const event=(await client.query(`INSERT INTO scan_events(box_id,sku,qty,destination,location_number,warehouse_date,cycle_id,user_id,device_id,inbound_id,client_id,box_sequence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING box_id AS "boxId",sku,qty,location_number AS destination,warehouse_date AS "warehouseDate",scanned_at AS "scannedAt",user_id AS "userId",device_id AS "deviceId"`,[boxId,box.sku,box.quantity,`LOCATION ${assignment.location_number}`,assignment.location_number,date,cycle.id,input.userId||'unknown',input.deviceId||'unknown',input.inboundId||null,input.clientId||null,input.boxSequence||null])).rows[0];
