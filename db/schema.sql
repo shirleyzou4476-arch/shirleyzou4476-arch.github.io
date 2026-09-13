@@ -54,9 +54,15 @@ CREATE TABLE IF NOT EXISTS daily_cycles (
   cycle_number INTEGER NOT NULL DEFAULT 1 CHECK (cycle_number > 0),
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
   started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  started_by TEXT NOT NULL DEFAULT 'system',
+  start_mode TEXT NOT NULL DEFAULT 'auto' CHECK (start_mode IN ('auto','manual')),
   closed_at TIMESTAMPTZ,
   UNIQUE (warehouse_date, cycle_number)
 );
+ALTER TABLE daily_cycles ADD COLUMN IF NOT EXISTS started_by TEXT NOT NULL DEFAULT 'system';
+ALTER TABLE daily_cycles ADD COLUMN IF NOT EXISTS start_mode TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE daily_cycles DROP CONSTRAINT IF EXISTS daily_cycles_start_mode_check;
+ALTER TABLE daily_cycles ADD CONSTRAINT daily_cycles_start_mode_check CHECK (start_mode IN ('auto','manual'));
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_daily_cycle_idx
   ON daily_cycles(warehouse_date) WHERE status = 'open';
 
