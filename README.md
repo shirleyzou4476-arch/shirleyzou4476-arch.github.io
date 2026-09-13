@@ -1,6 +1,6 @@
 # DockFlow
 
-DockFlow is a production warehouse receiving PWA. The Node server serves the React UI and same-origin API; **production data is stored in PostgreSQL (Neon recommended), not browser or in-memory demo state**.
+DockFlow is a PostgreSQL-backed warehouse receiving PWA. Sorting uses **exactly 50 permanent physical locations**, numbered 1 through 50. Each warehouse-local day starts with all 50 available; the first new SKU receives the lowest available number, and subsequent cartons for that SKU use the same number until its configured capacity is reached. When all 50 are occupied the API returns exactly `NO AVAILABLE SORTING LOCATION`, records an exception, and never creates location 51.
 
 ## Local development
 
@@ -15,36 +15,33 @@ npm start
 # http://localhost:3000
 ```
 
-`PORT` defaults to `3000`. `DATABASE_URL` is required for all data APIs; `/api/health` remains available without it and reports database status.
+`WAREHOUSE_TIME_ZONE` optionally sets the warehouse IANA timezone (defaults to `America/Chicago`). `DATABASE_URL` is required for data APIs.
 
 ## Render + Neon deployment
 
-1. Create a Neon project and copy its pooled connection string. It must include the password and SSL is enabled automatically in production.
-2. In Render, create **New → Web Service**, connect this repository, choose Node 18+, and set the build command to `npm install` and the start command to `npm start`.
-3. Add the environment variables `DATABASE_URL` (the Neon connection string), `NODE_ENV=production`, and optionally `PORT` (Render supplies `PORT` automatically; do not hard-code it).
-4. Deploy once, then run the schema and idempotent seed from a machine with `psql`:
+1. Create a Neon project and copy its pooled connection string.
+2. In Render, create a Node web service for this repository with build command `npm install` and start command `npm start`.
+3. Set `DATABASE_URL`, `NODE_ENV=production`, and optionally `WAREHOUSE_TIME_ZONE`. Render supplies `PORT`.
+4. **Post-merge, run the idempotent schema migration once against Neon** (there is no separate hand-written/manual SQL requirement):
 
 ```bash
 DATABASE_URL='your-neon-url' npm run db:schema
 DATABASE_URL='your-neon-url' npm run db:seed
 ```
 
-Alternatively run those two commands from Render's shell. Confirm `https://your-service.onrender.com/api/health` reports `database: connected`.
+The schema creates and backfills the 1–50 permanent slot table and adds the daily-cycle and assignment tables without deleting historical scans. Seed is safe to repeat. Confirm `/api/health` reports `database: connected`, then open the service and use **Start New Day / Reset** only when a supervisor intentionally closes the current cycle. Automatic rollover creates a new cycle on the next warehouse-local date.
 
 ## API
 
-- `GET /api/health`
-- `GET /api/boxes` and `/api/boxes/:boxId`
+- `GET /api/day` and `POST /api/day/reset`
+- `GET /api/locations` (always 50 numbered slots)
+- `GET /api/assignments` (today's `LOCATION N -> SKU` assignments)
 - `POST /api/scans` with `{boxId, sku, qty, userId, deviceId, inboundId, clientId, boxSequence}`
-- `GET /api/locations`
-- `POST /api/locations/import` with `{replace, locations: [{location, SKU, capacity}]}`
-- `GET /api/history?q=BOX-...`
-- `GET /api/exceptions`
-- `POST /api/exceptions/:id/resolve`
+- `GET /api/boxes`, `GET /api/boxes/:boxId`
+- `GET /api/history?q=...`
+- `GET /api/exceptions` and `POST /api/exceptions/:id/resolve`
 
-PostgreSQL's unique `scan_events(box_id)` constraint and the transactional row lock make duplicate scans return `409` safely under concurrency. `db/seed.sql` uses conflict-safe upserts and can be run repeatedly.
-
-The Locations page accepts a CSV with the exact header `location,SKU,capacity`. Imports are validated for required fields, positive whole-number capacity, duplicate location codes, and known products before PostgreSQL is changed. Selecting **Replace current locations** atomically replaces locations and rebuilds SKU routing priorities; clearing it adds routes to the existing configuration. Use **Download template** in the import dialog for a starter CSV. A failed import returns `422` with row-level errors and does not partially save.
+Duplicate box scans remain protected by the unique PostgreSQL constraint and transaction lock. Every scan persists warehouse date, SKU, box ID, quantity, numbered location (or an exception), scan time, user, and device. CSV location import is no longer part of normal operation; the numbered physical layout is provisioned by the schema.
 
 ## Tests
 
