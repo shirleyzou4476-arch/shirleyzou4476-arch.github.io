@@ -39,9 +39,16 @@ The schema creates and backfills the 1–50 permanent slot table and adds the da
 - `POST /api/scans` with `{boxId, sku, qty, userId, deviceId, inboundId, clientId, boxSequence}`
 - `GET /api/boxes`, `GET /api/boxes/:boxId`
 - `GET /api/history?q=...`
+- `GET /api/archive?from=YYYY-MM-DD&to=YYYY-MM-DD&sku=...&boxId=...&inbound=...&client=...&location=...` (date-grouped archive summaries)
+- `GET /api/archive/:date` (expanded day assignments, totals, users/devices, and exceptions)
+- `GET /api/archive/export?from=YYYY-MM-DD&to=YYYY-MM-DD` (CSV export; the same filters are supported)
 - `GET /api/exceptions` and `POST /api/exceptions/:id/resolve`
 
 Duplicate box scans remain protected by the unique PostgreSQL constraint and transaction lock. Every scan persists warehouse date, SKU, box ID, quantity, numbered location (or an exception), scan time, user, and device. CSV location import is no longer part of normal operation; the numbered physical layout is provisioned by the schema.
+
+## History / Archive
+
+The History tab queries PostgreSQL by warehouse-local date range and renders each active date as an expandable folder. A day includes every assignment's SKU, box, quantity, numbered location, inbound number, client, user, device, and scan time, plus totals and exceptions. Search filters are parameterized and indexed for date, SKU, Box ID, inbound number, client, and location. Export a single day by using the same date for `from` and `to`, or export a range. Starting a new day closes the current cycle only; it never deletes scan, box, assignment, or exception history.
 
 ## Tests
 
