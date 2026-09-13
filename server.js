@@ -3,13 +3,51 @@ import {readFile,stat} from 'node:fs/promises';
 import {extname, join, normalize} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import pg from 'pg';
+import bcrypt from 'bcryptjs';
+import {randomBytes,createHash} from 'node:crypto';
 
 const {Pool}=pg;
 const root=fileURLToPath(new URL('.',import.meta.url));
 export const MAX_SORTING_LOCATIONS=50;
 export const WAREHOUSE_TIME_ZONE='America/Chicago';
 export const pool=process.env.DATABASE_URL?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:undefined}):null;
+const SESSION_DAYS=7;
+if(pool){const cleanup=setInterval(()=>pool.query('DELETE FROM sessions WHERE expires_at<=now()').catch(()=>{}),60*60*1000);cleanup.unref?.()}
 const json=(res,status,data)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))};
+const cookieName='dockflow_session';
+const parseCookies=req=>Object.fromEntries((req.headers.cookie||'').split(';').filter(Boolean).map(v=>{const i=v.indexOf('=');return [v.slice(0,i).trim(),decodeURIComponent(v.slice(i+1))]}));
+const setCookie=(res,value,maxAge=SESSION_DAYS*86400)=>res.setHeader('set-cookie',`${cookieName}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${process.env.NODE_ENV==='production'?'; Secure':''}`);
+const clearCookie=res=>setCookie(res,'',0);
+const tokenHash=token=>createHash('sha256').update(token).digest('hex');
+async function sessionUser(req,res){
+  if(!pool)return null;
+  const token=parseCookies(req)[cookieName];if(!token)return null;
+  const {rows}=await pool.query(`SELECT u.id,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.active`,[tokenHash(token)]);
+  if(rows[0]){pool.query('UPDATE sessions SET last_seen_at=now() WHERE token_hash=$1',[tokenHash(token)]).catch(()=>{});return rows[0]}
+  return null;
+}
+const roleRank={worker:1,manager:2,admin:3};
+const routeRole=(method,path)=>{
+  if(path==='/api/auth/me'||path==='/api/auth/logout')return 'worker';
+  if(path==='/api/users'||path.startsWith('/api/users/'))return 'admin';
+  if(path==='/api/day/reset')return 'admin';
+  if(method==='GET'&&(/^\/api\/archive/.test(path)||path==='/api/history'))return 'manager';
+  if(path==='/api/health')return null;
+  if(path.startsWith('/api/'))return 'worker';
+  return null;
+};
+const sameOrigin=(req)=>{
+  if(!['POST','PUT','PATCH','DELETE'].includes(req.method))return true;
+  const source=req.headers.origin||req.headers.referer;
+  if(!source)return true;
+  try{return new URL(source).host===req.headers.host}catch{return false}
+};
+async function requireAuth(req,res,minimum){
+  const user=await sessionUser(req,res);
+  if(!user){json(res,401,{error:'Authentication required'});return null}
+  if(minimum&&roleRank[user.role]<roleRank[minimum]){json(res,403,{error:'Insufficient permissions'});return null}
+  return user;
+}
 const body=async req=>{let raw='';for await(const chunk of req)raw+=chunk;try{return raw?JSON.parse(raw):{}}catch{return null}};
 const requireDb=res=>{if(!pool){json(res,503,{error:'DATABASE_URL is required for this API'});return false}return true};
 const warehouseDateAt=date=>{
@@ -44,11 +82,46 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/health'){if(!pool)return json(res,200,{ok:true,service:'dockflow',database:'not configured'});try{await query('SELECT 1');return json(res,200,{ok:true,service:'dockflow',database:'connected'})}catch{return json(res,503,{ok:false,service:'dockflow',database:'unavailable'})}}
   if(path.startsWith('/api/')&&!requireDb(res))return;
   try{
+    if(path==='/api/auth/login'&&req.method==='POST'){
+      if(!sameOrigin(req))return json(res,403,{error:'Cross-origin request blocked'});
+      const input=await body(req);const email=String(input?.email||'').trim().toLowerCase();const passcode=String(input?.password||'');
+      const found=await query('SELECT * FROM users WHERE email=$1 AND active',[email]);
+      if(!found.rows[0]||!(await bcrypt.compare(passcode,found.rows[0].password_hash)))return json(res,401,{error:'Invalid email or password'});
+      await query('DELETE FROM sessions WHERE expires_at<=now()');
+      const token=randomBytes(32).toString('base64url');const expires=new Date(Date.now()+SESSION_DAYS*86400000);
+      await query('INSERT INTO sessions(user_id,token_hash,expires_at) VALUES($1,$2,$3)',[found.rows[0].id,tokenHash(token),expires]);setCookie(res,token);
+      return json(res,200,{user:{id:found.rows[0].id,email,role:found.rows[0].role},expiresAt:expires});
+    }
+    if(path==='/api/auth/me'&&req.method==='GET'){const user=await requireAuth(req,res,'worker');return user&&json(res,200,{user})}
+    if(path==='/api/auth/logout'&&req.method==='POST'){
+      if(!sameOrigin(req))return json(res,403,{error:'Cross-origin request blocked'});
+      const token=parseCookies(req)[cookieName];if(token)await query('DELETE FROM sessions WHERE token_hash=$1',[tokenHash(token)]);clearCookie(res);return json(res,200,{ok:true});
+    }
+    const minimum=routeRole(req.method,path);
+    if(minimum){if(!sameOrigin(req))return json(res,403,{error:'Cross-origin request blocked'});const user=await requireAuth(req,res,minimum);if(!user)return;
+      req.user=user;
+    }
+    if(path==='/api/users'&&req.method==='GET'){const {rows}=await query(`SELECT id,email,role,active,created_at AS "createdAt" FROM users ORDER BY email`);return json(res,200,rows)}
+    if(path==='/api/users'&&req.method==='POST'){
+      const input=await body(req);const email=String(input?.email||'').trim().toLowerCase();const role=input?.role;const passcode=String(input?.password||'');
+      if(!email||!['admin','manager','worker'].includes(role)||passcode.length<12)return json(res,400,{error:'email, exact role, and a 12+ character password are required'});
+      try{const hash=await bcrypt.hash(passcode,12);const {rows}=await query(`INSERT INTO users(email,password_hash,role) VALUES($1,$2,$3) RETURNING id,email,role,active`,[email,hash,role]);return json(res,201,rows[0])}catch(err){if(err.code==='23505')return json(res,409,{error:'Email already exists'});throw err}
+    }
+    const userMatch=path.match(/^\/api\/users\/([^/]+)$/);
+    if(userMatch&&req.method==='PATCH'){
+      const input=await body(req);const id=userMatch[1];const current=(await query('SELECT id,role,active FROM users WHERE id=$1',[id])).rows[0];if(!current)return json(res,404,{error:'User not found'});
+      const nextRole=input?.role||current.role,nextActive=input?.active===undefined?current.active:!!input.active;
+      if(input?.password&&String(input.password).length<12)return json(res,400,{error:'Password must be at least 12 characters'});
+      const passcode=input?.password?await bcrypt.hash(String(input.password),12):null;
+      if(!['admin','manager','worker'].includes(nextRole))return json(res,400,{error:'Invalid role'});
+      if(current.role==='admin'&&(!nextActive||nextRole!=='admin')){const count=Number((await query(`SELECT count(*) FROM users WHERE role='admin' AND active`)).rows[0].count);if(count<=1)return json(res,400,{error:'The last active admin cannot be removed or demoted'})}
+      const {rows}=await query(`UPDATE users SET role=$2,active=$3,password_hash=COALESCE($4,password_hash),updated_at=now() WHERE id=$1 RETURNING id,email,role,active`,[id,nextRole,nextActive,passcode]);return json(res,200,rows[0]);
+    }
     if(path==='/api/day'&&req.method==='GET'){
       const now=new Date();const date=warehouseDateAt(now);const client=await pool.connect();try{await client.query('BEGIN');const cycle=await openCycle(client,date,'system','auto',now);const {rows}=await client.query(`SELECT dc.warehouse_date AS "warehouseDate",dc.cycle_number AS "cycleNumber",dc.started_at AS "startedAt",dc.started_by AS "startedBy",dc.start_mode AS "startMode",COUNT(da.id)::int AS assignments FROM daily_cycles dc LEFT JOIN daily_assignments da ON da.cycle_id=dc.id WHERE dc.id=$1 GROUP BY dc.id`,[cycle.id]);await client.query('COMMIT');return json(res,200,rows[0])}catch(err){await client.query('ROLLBACK');throw err}finally{client.release()}
     }
     if(path==='/api/day/reset'&&req.method==='POST'){
-      const date=warehouseDate();const input=await body(req)||{};if(input.role!=='supervisor')return json(res,403,{error:'Supervisor role is required to start a new day'});const client=await pool.connect();try{await client.query('BEGIN');await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:${date}`]);const current=await client.query(`SELECT * FROM daily_cycles WHERE warehouse_date=$1 AND status='open' ORDER BY cycle_number DESC LIMIT 1 FOR UPDATE`,[date]);if(current.rows[0])await closeCycle(client,current.rows[0]);const cycle=await openCycle(client,date,input.userId||'supervisor','manual');await client.query('COMMIT');return json(res,201,{warehouseDate:date,cycleNumber:cycle.cycle_number,startedAt:cycle.started_at,startedBy:cycle.started_by,startMode:cycle.start_mode,assignments:0})}catch(err){await client.query('ROLLBACK');throw err}finally{client.release()}
+      const date=warehouseDate();const client=await pool.connect();try{await client.query('BEGIN');await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:${date}`]);const current=await client.query(`SELECT * FROM daily_cycles WHERE warehouse_date=$1 AND status='open' ORDER BY cycle_number DESC LIMIT 1 FOR UPDATE`,[date]);if(current.rows[0])await closeCycle(client,current.rows[0]);const cycle=await openCycle(client,date,req.user.id,'manual');await client.query('COMMIT');return json(res,201,{warehouseDate:date,cycleNumber:cycle.cycle_number,startedAt:cycle.started_at,startedBy:cycle.started_by,startMode:cycle.start_mode,assignments:0})}catch(err){await client.query('ROLLBACK');throw err}finally{client.release()}
     }
     if(path==='/api/boxes'&&req.method==='GET'){const {rows}=await query(`SELECT b.box_id AS "boxId",b.sku,b.quantity AS qty,p.name,b.status,b.received_at AS "receivedAt" FROM boxes b JOIN products p USING(sku) ORDER BY b.box_id`);return json(res,200,rows)}
     const boxMatch=path.match(/^\/api\/boxes\/([^/]+)$/);if(boxMatch&&req.method==='GET'){const {rows}=await query(`SELECT b.box_id AS "boxId",b.sku,b.quantity AS qty,p.name,b.status,b.received_at AS "receivedAt" FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1`,[boxMatch[1].toUpperCase()]);return rows[0]?json(res,200,rows[0]):json(res,404,{error:'Box not found'})}
@@ -90,17 +163,17 @@ const server=http.createServer(async(req,res)=>{
         await client.query('BEGIN');const scannedAt=new Date();const date=warehouseDateAt(scannedAt);const found=await client.query('SELECT b.*,p.name FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1 FOR UPDATE',[boxId]);let box=found.rows[0];
         if(!box){if(!input.sku||!Number.isInteger(input.qty)||input.qty<1){await client.query('ROLLBACK');return json(res,400,{error:'Unknown box; sku and positive integer qty are required'})}box=(await client.query(`INSERT INTO boxes(box_id,sku,quantity,status) VALUES($1,$2,$3,'pending') RETURNING *`,[boxId,String(input.sku).trim().toUpperCase(),input.qty])).rows[0]}
         const existing=await client.query(`SELECT box_id AS "boxId",sku,qty,location_number AS destination,scanned_at AS "scannedAt" FROM scan_events WHERE box_id=$1`,[boxId]);if(existing.rows[0]){await client.query('ROLLBACK');return json(res,409,{error:'Duplicate scan',previous:existing.rows[0]})}
-        const cycle=await openCycle(client,date,input.userId||'system','auto',scannedAt);
+        const cycle=await openCycle(client,date,req.user.id,'auto',scannedAt);
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:assignments:${cycle.id}`]);
         const skuAssignments=(await client.query(`SELECT da.* FROM daily_assignments da WHERE da.cycle_id=$1 AND da.sku=$2 ORDER BY da.location_number FOR UPDATE`,[cycle.id,box.sku])).rows;
         let assignment=null;
         for(const candidate of skuAssignments){const filled=Number((await client.query(`SELECT COALESCE(SUM(qty),0)::int AS filled FROM scan_events WHERE cycle_id=$1 AND location_number=$2`,[cycle.id,candidate.location_number])).rows[0].filled);if(filled+box.quantity<=candidate.capacity){assignment=candidate;break}}
         if(!assignment){
           const next=(await client.query(`SELECT sl.* FROM sorting_locations sl WHERE NOT EXISTS (SELECT 1 FROM daily_assignments da WHERE da.cycle_id=$1 AND da.location_number=sl.location_number) ORDER BY sl.location_number LIMIT 1 FOR UPDATE`,[cycle.id])).rows[0];
-          if(!next){await client.query(`INSERT INTO exceptions(box_id,reason,warehouse_date,user_id,device_id) VALUES($1,$2,$3,$4,$5)`,[boxId,'NO AVAILABLE SORTING LOCATION',date,input.userId||'unknown',input.deviceId||'unknown']);await client.query('COMMIT');return json(res,409,{error:'NO AVAILABLE SORTING LOCATION',exception:true})}
-          assignment=(await client.query(`INSERT INTO daily_assignments(cycle_id,warehouse_date,sku,location_number,capacity,assigned_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[cycle.id,date,box.sku,next.location_number,next.capacity,input.userId||'system'])).rows[0];
+          if(!next){await client.query(`INSERT INTO exceptions(box_id,reason,warehouse_date,user_id,device_id) VALUES($1,$2,$3,$4,$5)`,[boxId,'NO AVAILABLE SORTING LOCATION',date,req.user.id,input.deviceId||'unknown']);await client.query('COMMIT');return json(res,409,{error:'NO AVAILABLE SORTING LOCATION',exception:true})}
+          assignment=(await client.query(`INSERT INTO daily_assignments(cycle_id,warehouse_date,sku,location_number,capacity,assigned_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[cycle.id,date,box.sku,next.location_number,next.capacity,req.user.id])).rows[0];
         }
-        const event=(await client.query(`INSERT INTO scan_events(box_id,sku,qty,destination,location_number,warehouse_date,cycle_id,user_id,device_id,inbound_id,client_id,box_sequence,scanned_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING box_id AS "boxId",sku,qty,location_number AS destination,warehouse_date AS "warehouseDate",scanned_at AS "scannedAt",user_id AS "userId",device_id AS "deviceId"`,[boxId,box.sku,box.quantity,`LOCATION ${assignment.location_number}`,assignment.location_number,date,cycle.id,input.userId||'unknown',input.deviceId||'unknown',input.inboundId||null,input.clientId||null,input.boxSequence||null,scannedAt])).rows[0];
+        const event=(await client.query(`INSERT INTO scan_events(box_id,sku,qty,destination,location_number,warehouse_date,cycle_id,user_id,device_id,inbound_id,client_id,box_sequence,scanned_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING box_id AS "boxId",sku,qty,location_number AS destination,warehouse_date AS "warehouseDate",scanned_at AS "scannedAt",user_id AS "userId",device_id AS "deviceId"`,[boxId,box.sku,box.quantity,`LOCATION ${assignment.location_number}`,assignment.location_number,date,cycle.id,req.user.id,input.deviceId||'unknown',input.inboundId||null,input.clientId||null,input.boxSequence||null,scannedAt])).rows[0];
         await client.query(`UPDATE boxes SET status='received',received_at=COALESCE(received_at,now()) WHERE box_id=$1`,[boxId]);await client.query('COMMIT');return json(res,201,event);
       }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Duplicate scan'});if(err.code==='23503')return json(res,400,{error:'SKU does not exist'});throw err}finally{client.release()}
     }
