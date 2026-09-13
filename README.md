@@ -32,15 +32,23 @@ The production warehouse timezone is fixed to **America/Chicago** in the API. It
 
 1. Create a Neon project and copy its pooled connection string.
 2. In Render, create a Node web service for this repository with build command `npm install` and start command `npm start`.
-3. Set `DATABASE_URL` and `NODE_ENV=production`. Render supplies `PORT`.
-4. **After the PR is merged, run the idempotent schema migration once against Neon** (there is no separate hand-written/manual SQL requirement):
+3. Set these Render environment variables: `DATABASE_URL` (Neon pooled URL), `NODE_ENV=production`, and let Render provide `PORT`. Do not add frontend secrets.
+4. **After the PR is merged, redeploy Render and run the idempotent schema migration once against Neon** (there is no separate hand-written/manual SQL requirement):
 
 ```bash
 DATABASE_URL='your-neon-url' npm run db:schema
 DATABASE_URL='your-neon-url' npm run db:seed
 ```
 
-5. Confirm `/api/health` reports `database: connected`, then open the service. If the current cycle must be restarted on the same local date, a supervisor uses **Start New Day / Reset** and confirms the screen; the API requires `role: supervisor`. Automatic rollover creates a new cycle on the next America/Chicago date. The migration adds cycle provenance (`started_by`, `start_mode`) and never deletes historical scans, assignments, boxes, or exceptions.
+5. Confirm `/api/health` reports `database: connected`, then open the service. If the current cycle must be restarted on the same local date, an administrator uses **Start New Day / Reset** and confirms the screen. Automatic rollover creates a new cycle on the next America/Chicago date. The migration adds cycle provenance (`started_by`, `start_mode`) and never deletes historical scans, assignments, boxes, or exceptions.
+
+### Post-deployment authentication checklist
+
+- Run `npm run db:create-admin -- admin@example.com 'a unique 12+ character password'` against the production `DATABASE_URL` once.
+- Sign in from the Render URL, verify the admin role is shown, create one worker and one manager, and verify logout/login.
+- Verify a worker can receive and use PDA Scan, Locations, and Exceptions, but receives 403 from `/api/history`, `/api/archive`, `/api/day/reset`, and `/api/users`.
+- Verify the admin can change roles, reset a password, disable/reactivate users, and cannot disable or demote the last active admin.
+- Verify Android PDA camera/manual scan, duplicate scans, exact 50 locations, Chicago rollover, and historical archive data.
 
 ## API
 
@@ -66,3 +74,15 @@ The History tab queries PostgreSQL by warehouse-local date range and renders eac
 ```bash
 npm test
 ```
+
+## Authentication and roles
+
+All API and application routes (except `/api/health` and login) require a database-backed session. Passwords are bcrypt-hashed, sessions are short-lived and stored as hashes, and the browser receives an HttpOnly SameSite cookie (Secure in production). State-changing requests are same-origin checked. Roles are exactly `admin`, `manager`, and `worker`: administrators have full access; managers can operate receiving, exceptions, history, archive and reports but cannot manage users or reset a day; workers are limited to Receiving, PDA Scan, Locations and Exceptions. Unauthorized direct URLs and API calls return 401/403.
+
+After `npm run db:schema`, create the first administrator without placing a password in source control:
+
+```bash
+DATABASE_URL='your-neon-url' npm run db:create-admin -- admin@example.com 'use-a-long-password-here'
+```
+
+Run the schema migration before starting a deployment and periodically clean expired sessions (login also performs cleanup; `DELETE FROM sessions WHERE expires_at <= now()` is safe to schedule). The administrator Users page can create and disable accounts, while preventing removal or demotion of the last active administrator.
