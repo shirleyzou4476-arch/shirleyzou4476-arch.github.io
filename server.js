@@ -33,7 +33,10 @@ const bootstrapAllowed=(req)=>{
   if(!previous||now-previous.startedAt>=BOOTSTRAP_WINDOW_MS){bootstrapAttempts.set(key,{startedAt:now,count:1});return true}
   previous.count+=1;return previous.count<=5;
 };
-const bootstrapError=res=>json(res,403,{error:'Setup unavailable'});
+const setupFailure=(req,res,reason,status=403)=>{
+  console.warn(JSON.stringify({event:'setup_failure',reason,status,method:req.method,path:new URL(req.url,'http://localhost').pathname}));
+  return json(res,status,{error:'Setup unavailable'});
+};
 async function sessionUser(req,res){
   if(!pool)return null;
   const token=parseCookies(req)[cookieName];if(!token)return null;
@@ -93,32 +96,44 @@ async function closeCycle(client,cycle){await client.query(`UPDATE daily_cycles 
 
 const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost');const path=url.pathname;
-  if(req.method==='OPTIONS'){res.writeHead(204,{'access-control-allow-origin':url.origin,'access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'});return res.end()}
+  if(req.method==='OPTIONS'){
+    const origin=req.headers.origin;
+    const headers=String(req.headers['access-control-request-headers']||'').toLowerCase().split(',').map(value=>value.trim()).filter(Boolean);
+    const allowedHeaders=new Set(['content-type','x-dockflow-setup-token']);
+    if(origin&&origin!==`${requestIsHttps(req)?'https':'http'}://${req.headers.host}`)return res.writeHead(403).end();
+    if(headers.some(header=>!allowedHeaders.has(header)))return res.writeHead(403).end();
+    res.writeHead(204,{'access-control-allow-origin':origin||`${requestIsHttps(req)?'https':'http'}://${req.headers.host}`,'access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'Content-Type, X-Dockflow-Setup-Token','cache-control':'no-store'});return res.end()
+  }
   if(path==='/api/health'){if(!pool)return json(res,200,{ok:true,service:'dockflow',database:'not configured'});try{await query('SELECT 1');return json(res,200,{ok:true,service:'dockflow',database:'connected'})}catch{return json(res,503,{ok:false,service:'dockflow',database:'unavailable'})}}
   if(path==='/api/auth/bootstrap'&&req.method==='POST'){
-    if(!pool)return bootstrapError(res);
-    if(process.env.NODE_ENV==='production'&&!requestIsHttps(req))return bootstrapError(res);
-    if(!bootstrapAllowed(req))return json(res,429,{error:'Setup unavailable'});
+    if(!pool)return setupFailure(req,res,'database_unconfigured',503);
+    if(process.env.NODE_ENV==='production'&&!requestIsHttps(req))return setupFailure(req,res,'https_required');
+    if(!bootstrapAllowed(req))return setupFailure(req,res,'rate_limited',429);
     const configuredToken=process.env.DOCKFLOW_SETUP_TOKEN;
     const providedToken=String(req.headers['x-dockflow-setup-token']||'');
-    if(!configuredToken||configuredToken.length<32||!providedToken||!sameToken(providedToken,configuredToken))return bootstrapError(res);
-    if(!sameOrigin(req))return bootstrapError(res);
+    if(!configuredToken||configuredToken.length<32||!providedToken||!sameToken(providedToken,configuredToken))return setupFailure(req,res,'token_invalid');
+    if(!sameOrigin(req))return setupFailure(req,res,'origin_invalid');
     const input=await body(req);const email=String(input?.email||'').trim().toLowerCase();const passcode=String(input?.password||'');
-    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||passcode.length<12)return bootstrapError(res);
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||passcode.length<12)return setupFailure(req,res,'input_invalid',400);
     const client=await pool.connect();
     try{
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',['dockflow:admin-bootstrap']);
       const state=(await client.query('SELECT consumed_at FROM admin_bootstrap WHERE id=true FOR UPDATE')).rows[0];
       const activeAdmin=(await client.query(`SELECT 1 FROM users WHERE role='admin' AND active LIMIT 1`)).rows[0];
-      if(!state||state.consumed_at||activeAdmin){await client.query('ROLLBACK');return bootstrapError(res)}
+      if(!state||state.consumed_at||activeAdmin){await client.query('ROLLBACK');return setupFailure(req,res,'already_initialized')}
       const hash=await bcrypt.hash(passcode,12);
       const created=(await client.query(`INSERT INTO users(email,password_hash,role) VALUES($1,$2,'admin') RETURNING id`,[email,hash])).rows[0];
       await client.query('UPDATE admin_bootstrap SET consumed_at=now(),consumed_by=$1 WHERE id=true',[created.id]);
       await client.query('COMMIT');
       bootstrapAttempts.delete(clientAddress(req));
       return json(res,201,{ok:true});
-    }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return bootstrapError(res);throw err}finally{client.release()}
+    }catch(err){
+      await client.query('ROLLBACK');
+      if(err.code==='23505')return setupFailure(req,res,'duplicate_email',409);
+      console.error(JSON.stringify({event:'setup_failure',reason:'bootstrap_database_error',status:500,code:err.code||'unknown'}));
+      return setupFailure(req,res,'internal_error',500);
+    }finally{client.release()}
   }
   if(path.startsWith('/api/')&&!requireDb(res))return;
   try{
@@ -218,7 +233,7 @@ const server=http.createServer(async(req,res)=>{
       }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Duplicate scan'});if(err.code==='23503')return json(res,400,{error:'SKU does not exist'});throw err}finally{client.release()}
     }
     if(path.startsWith('/api/'))return json(res,404,{error:'Not found'});
-    if(path==='/setup'&&process.env.NODE_ENV==='production'&&!requestIsHttps(req))return bootstrapError(res);
+    if(path==='/setup'&&process.env.NODE_ENV==='production'&&!requestIsHttps(req))return setupFailure(req,res,'https_required');
     const relative=path==='/'?'index.html':path.slice(1);const file=normalize(join(root,relative));
     if(!file.startsWith(root))return json(res,404,{error:'Not found'});
     let resolved=file;
