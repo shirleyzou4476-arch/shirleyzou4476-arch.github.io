@@ -1,15 +1,5 @@
-INSERT INTO products (sku,name) VALUES
- ('SKU-ALP-01','Alpine Trail Bottle'),('SKU-BLU-07','Blue Ridge Mug'),('SKU-CED-03','Cedar Camp Towel')
-ON CONFLICT (sku) DO NOTHING;
-INSERT INTO locations (code,capacity,sku) VALUES
- ('A-01-03',100,'SKU-ALP-01'),('B-02-01',60,'SKU-BLU-07'),('C-01-02',50,'SKU-CED-03')
-ON CONFLICT (code) DO NOTHING;
-INSERT INTO routing_rules (sku,priority,location_code,capacity) VALUES
- ('SKU-ALP-01',1,'A-01-03',100),('SKU-ALP-01',2,'A-01-04',100),
- ('SKU-BLU-07',1,'B-02-01',60),('SKU-BLU-07',2,'B-02-02',60),
- ('SKU-CED-03',1,'C-01-02',50),('SKU-CED-03',2,'C-01-03',50)
-ON CONFLICT (sku,priority) DO NOTHING;
-INSERT INTO boxes (box_id,sku,quantity,received_at,status) VALUES
- ('BOX-1042','SKU-ALP-01',24,now(),'received'),('BOX-1043','SKU-BLU-07',12,now(),'received'),
- ('BOX-1044','SKU-ALP-01',18,now(),'received'),('BOX-1045','SKU-CED-03',8,now(),'received')
-ON CONFLICT (box_id) DO NOTHING;
+INSERT INTO products(sku,name) VALUES ('SKU-ALP-01','Alpine Trail Bottle'),('SKU-BLU-07','Blue Ridge Mug'),('SKU-CED-03','Cedar Camp Towel') ON CONFLICT(sku) DO UPDATE SET name=EXCLUDED.name;
+INSERT INTO locations(code,capacity,sku) VALUES ('A-01-03',100,'SKU-ALP-01'),('A-01-04',100,'SKU-ALP-01'),('B-02-01',60,'SKU-BLU-07'),('B-02-02',60,'SKU-BLU-07'),('C-01-02',50,'SKU-CED-03'),('C-01-03',50,'SKU-CED-03') ON CONFLICT(code) DO UPDATE SET capacity=EXCLUDED.capacity,sku=EXCLUDED.sku;
+INSERT INTO routing_rules(sku,priority,location_code,capacity) VALUES ('SKU-ALP-01',1,'A-01-03',100),('SKU-ALP-01',2,'A-01-04',100),('SKU-BLU-07',1,'B-02-01',60),('SKU-BLU-07',2,'B-02-02',60),('SKU-CED-03',1,'C-01-02',50),('SKU-CED-03',2,'C-01-03',50) ON CONFLICT(sku,priority) DO UPDATE SET location_code=EXCLUDED.location_code,capacity=EXCLUDED.capacity;
+INSERT INTO boxes(box_id,sku,quantity,status) VALUES ('BOX-1042','SKU-ALP-01',24,'pending'),('BOX-1043','SKU-BLU-07',12,'pending'),('BOX-1044','SKU-ALP-01',18,'pending'),('BOX-1045','SKU-CED-03',8,'pending') ON CONFLICT(box_id) DO UPDATE SET sku=EXCLUDED.sku,quantity=EXCLUDED.quantity;
+INSERT INTO exceptions(box_id,reason) SELECT 'BOX-1042','Quantity mismatch — verify carton count' WHERE NOT EXISTS (SELECT 1 FROM exceptions WHERE box_id='BOX-1042' AND status='open');

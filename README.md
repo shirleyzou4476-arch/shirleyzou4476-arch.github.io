@@ -1,31 +1,50 @@
 # DockFlow
 
-DockFlow is a lightweight warehouse receiving and sorting PWA demo. It runs as a static React frontend (React/Babel are loaded from a CDN) with an optional dependency-free Node API. No build step is required.
+DockFlow is a production warehouse receiving PWA. The Node server serves the React UI and same-origin API; **production data is stored in PostgreSQL (Neon recommended), not browser or in-memory demo state**.
 
-## Run locally
+## Local development
 
-Requires Node 18+. From this directory:
+Requires Node 18+, PostgreSQL, and `psql`:
 
 ```bash
+npm install
+export DATABASE_URL='postgres://...'
+npm run db:schema
+npm run db:seed
 npm start
-# open http://localhost:3000
+# http://localhost:3000
 ```
 
-The browser demo works offline from the UI after the initial CDN load. Use **BOX-1042**, **BOX-1043**, **BOX-1044**, or **BOX-1045** in the receiver. QR payloads in the form `BOXID:BOX-9 SKU:SKU-ALP-01 QTY:10` are also parsed. The camera button is a safe fallback that loads a known demo label; a production scanner can replace that handler with `BarcodeDetector` or `html5-qrcode` without changing routing.
+`PORT` defaults to `3000`. `DATABASE_URL` is required for all data APIs; `/api/health` remains available without it and reports database status.
+
+## Render + Neon deployment
+
+1. Create a Neon project and copy its pooled connection string. It must include the password and SSL is enabled automatically in production.
+2. In Render, create **New → Web Service**, connect this repository, choose Node 18+, and set the build command to `npm install` and the start command to `npm start`.
+3. Add the environment variables `DATABASE_URL` (the Neon connection string), `NODE_ENV=production`, and optionally `PORT` (Render supplies `PORT` automatically; do not hard-code it).
+4. Deploy once, then run the schema and idempotent seed from a machine with `psql`:
+
+```bash
+DATABASE_URL='your-neon-url' npm run db:schema
+DATABASE_URL='your-neon-url' npm run db:seed
+```
+
+Alternatively run those two commands from Render's shell. Confirm `https://your-service.onrender.com/api/health` reports `database: connected`.
 
 ## API
 
-`GET /api/health`, `GET /api/boxes`, and `GET /api/boxes/:boxId` are included. `POST /api/scans` accepts `{boxId, sku, qty, userId, deviceId, inboundId, clientId, boxSequence}` and returns `409` with the prior event for duplicate boxes. The frontend deliberately defaults to local demo data so it remains usable on a static host.
+- `GET /api/health`
+- `GET /api/boxes` and `/api/boxes/:boxId`
+- `POST /api/scans` with `{boxId, sku, qty, userId, deviceId, inboundId, clientId, boxSequence}`
+- `GET /api/locations`
+- `GET /api/history?q=BOX-...`
+- `GET /api/exceptions`
+- `POST /api/exceptions/:id/resolve`
 
-## PostgreSQL
+PostgreSQL's unique `scan_events(box_id)` constraint and the transactional row lock make duplicate scans return `409` safely under concurrency. `db/seed.sql` uses conflict-safe upserts and can be run repeatedly.
 
-`db/schema.sql` creates products, capacity locations, boxes, receipts (with duplicate protection), and exceptions. Run schema then seed against a PostgreSQL database:
+## Tests
 
 ```bash
-psql "$DATABASE_URL" -f db/schema.sql
-psql "$DATABASE_URL" -f db/seed.sql
+npm test
 ```
-
-## Included flow
-
-Receiving parses BoxID/SKU/quantity, routes the SKU to its capacity location, advances the receiving bar, warns in red on duplicate scans, and resets the success state. Locations, searchable receiving history, and exception resolution are available from the sidebar.
