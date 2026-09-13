@@ -15,21 +15,21 @@ npm start
 # http://localhost:3000
 ```
 
-`WAREHOUSE_TIME_ZONE` optionally sets the warehouse IANA timezone (defaults to `America/Chicago`). `DATABASE_URL` is required for data APIs.
+The production warehouse timezone is fixed to **America/Chicago** in the API. It is never taken from the server timezone, UTC, or an environment override; the JavaScript `Intl` timezone database applies DST transitions automatically. `DATABASE_URL` is required for data APIs.
 
 ## Render + Neon deployment
 
 1. Create a Neon project and copy its pooled connection string.
 2. In Render, create a Node web service for this repository with build command `npm install` and start command `npm start`.
-3. Set `DATABASE_URL`, `NODE_ENV=production`, and optionally `WAREHOUSE_TIME_ZONE`. Render supplies `PORT`.
-4. **Post-merge, run the idempotent schema migration once against Neon** (there is no separate hand-written/manual SQL requirement):
+3. Set `DATABASE_URL` and `NODE_ENV=production`. Render supplies `PORT`.
+4. **After the PR is merged, run the idempotent schema migration once against Neon** (there is no separate hand-written/manual SQL requirement):
 
 ```bash
 DATABASE_URL='your-neon-url' npm run db:schema
 DATABASE_URL='your-neon-url' npm run db:seed
 ```
 
-The schema creates and backfills the 1–50 permanent slot table and adds the daily-cycle and assignment tables without deleting historical scans. Seed is safe to repeat. Confirm `/api/health` reports `database: connected`, then open the service and use **Start New Day / Reset** only when a supervisor intentionally closes the current cycle. Automatic rollover creates a new cycle on the next warehouse-local date.
+5. Confirm `/api/health` reports `database: connected`, then open the service. If the current cycle must be restarted on the same local date, a supervisor uses **Start New Day / Reset** and confirms the screen; the API requires `role: supervisor`. Automatic rollover creates a new cycle on the next America/Chicago date. The migration adds cycle provenance (`started_by`, `start_mode`) and never deletes historical scans, assignments, boxes, or exceptions.
 
 ## API
 
@@ -44,7 +44,7 @@ The schema creates and backfills the 1–50 permanent slot table and adds the da
 - `GET /api/archive/export?from=YYYY-MM-DD&to=YYYY-MM-DD` (CSV export; the same filters are supported)
 - `GET /api/exceptions` and `POST /api/exceptions/:id/resolve`
 
-Duplicate box scans remain protected by the unique PostgreSQL constraint and transaction lock. Every scan persists warehouse date, SKU, box ID, quantity, numbered location (or an exception), scan time, user, and device. CSV location import is no longer part of normal operation; the numbered physical layout is provisioned by the schema.
+Duplicate box scans remain protected by the unique PostgreSQL constraint and transaction lock. Every scan persists one captured timestamp (`timestamptz`) and the matching America/Chicago warehouse date, SKU, box ID, quantity, numbered location (or an exception), user, and device. Assignment selection is serialized per daily cycle so capacity routing cannot over-allocate under concurrent scans. CSV location import is no longer part of normal operation; the numbered physical layout is provisioned by the schema.
 
 ## History / Archive
 

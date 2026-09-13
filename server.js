@@ -7,11 +7,17 @@ import pg from 'pg';
 const {Pool}=pg;
 const root=fileURLToPath(new URL('.',import.meta.url));
 export const MAX_SORTING_LOCATIONS=50;
+export const WAREHOUSE_TIME_ZONE='America/Chicago';
 export const pool=process.env.DATABASE_URL?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:undefined}):null;
 const json=(res,status,data)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))};
 const body=async req=>{let raw='';for await(const chunk of req)raw+=chunk;try{return raw?JSON.parse(raw):{}}catch{return null}};
 const requireDb=res=>{if(!pool){json(res,503,{error:'DATABASE_URL is required for this API'});return false}return true};
-const warehouseDate=()=>new Intl.DateTimeFormat('en-CA',{timeZone:process.env.WAREHOUSE_TIME_ZONE||'America/Chicago',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+const warehouseDateAt=date=>{
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:WAREHOUSE_TIME_ZONE,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date);
+  const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+};
+const warehouseDate=()=>warehouseDateAt(new Date());
 const query=(sql,params)=>pool.query(sql,params);
 const csvCell=value=>`"${String(value??'').replaceAll('"','""')}"`;
 const archiveDate=value=>/^\d{4}-\d{2}-\d{2}$/.test(value||'')?value:null;
@@ -22,13 +28,13 @@ const archiveFilters=(params,startIndex=1)=>{
   return {clauses,values};
 };
 
-async function openCycle(client,date,user='system'){
+async function openCycle(client,date,user='system',mode='auto',startedAt=new Date()){
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:${date}`]);
   await client.query(`UPDATE daily_cycles SET status='closed',closed_at=COALESCE(closed_at,now()) WHERE status='open' AND warehouse_date<>$1`,[date]);
   const current=await client.query(`SELECT * FROM daily_cycles WHERE warehouse_date=$1 AND status='open' ORDER BY cycle_number DESC LIMIT 1 FOR UPDATE`,[date]);
   if(current.rows[0])return current.rows[0];
   const prior=await client.query('SELECT COALESCE(MAX(cycle_number),0)::int AS n FROM daily_cycles WHERE warehouse_date=$1',[date]);
-  return (await client.query(`INSERT INTO daily_cycles(warehouse_date,cycle_number,status) VALUES($1,$2,'open') RETURNING *`,[date,prior.rows[0].n+1])).rows[0];
+  return (await client.query(`INSERT INTO daily_cycles(warehouse_date,cycle_number,status,started_by,start_mode,started_at) VALUES($1,$2,'open',$3,$4,$5) RETURNING *`,[date,prior.rows[0].n+1,user,mode,startedAt])).rows[0];
 }
 async function closeCycle(client,cycle){await client.query(`UPDATE daily_cycles SET status='closed',closed_at=now() WHERE id=$1`,[cycle.id])}
 
@@ -39,10 +45,10 @@ const server=http.createServer(async(req,res)=>{
   if(path.startsWith('/api/')&&!requireDb(res))return;
   try{
     if(path==='/api/day'&&req.method==='GET'){
-      const date=warehouseDate();const client=await pool.connect();try{const cycle=await openCycle(client,date);const {rows}=await client.query(`SELECT dc.warehouse_date AS "warehouseDate",dc.cycle_number AS "cycleNumber",COUNT(da.id)::int AS assignments FROM daily_cycles dc LEFT JOIN daily_assignments da ON da.cycle_id=dc.id WHERE dc.id=$1 GROUP BY dc.id`,[cycle.id]);return json(res,200,rows[0])}finally{client.release()}
+      const now=new Date();const date=warehouseDateAt(now);const client=await pool.connect();try{await client.query('BEGIN');const cycle=await openCycle(client,date,'system','auto',now);const {rows}=await client.query(`SELECT dc.warehouse_date AS "warehouseDate",dc.cycle_number AS "cycleNumber",dc.started_at AS "startedAt",dc.started_by AS "startedBy",dc.start_mode AS "startMode",COUNT(da.id)::int AS assignments FROM daily_cycles dc LEFT JOIN daily_assignments da ON da.cycle_id=dc.id WHERE dc.id=$1 GROUP BY dc.id`,[cycle.id]);await client.query('COMMIT');return json(res,200,rows[0])}catch(err){await client.query('ROLLBACK');throw err}finally{client.release()}
     }
     if(path==='/api/day/reset'&&req.method==='POST'){
-      const date=warehouseDate();const input=await body(req)||{};const client=await pool.connect();try{await client.query('BEGIN');const current=await client.query(`SELECT * FROM daily_cycles WHERE warehouse_date=$1 AND status='open' ORDER BY cycle_number DESC LIMIT 1 FOR UPDATE`,[date]);if(current.rows[0])await closeCycle(client,current.rows[0]);const cycle=await openCycle(client,date,input.userId||'supervisor');await client.query('COMMIT');return json(res,201,{warehouseDate:date,cycleNumber:cycle.cycle_number,assignments:0})}catch(err){await client.query('ROLLBACK');throw err}finally{client.release()}
+      const date=warehouseDate();const input=await body(req)||{};if(input.role!=='supervisor')return json(res,403,{error:'Supervisor role is required to start a new day'});const client=await pool.connect();try{await client.query('BEGIN');await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:${date}`]);const current=await client.query(`SELECT * FROM daily_cycles WHERE warehouse_date=$1 AND status='open' ORDER BY cycle_number DESC LIMIT 1 FOR UPDATE`,[date]);if(current.rows[0])await closeCycle(client,current.rows[0]);const cycle=await openCycle(client,date,input.userId||'supervisor','manual');await client.query('COMMIT');return json(res,201,{warehouseDate:date,cycleNumber:cycle.cycle_number,startedAt:cycle.started_at,startedBy:cycle.started_by,startMode:cycle.start_mode,assignments:0})}catch(err){await client.query('ROLLBACK');throw err}finally{client.release()}
     }
     if(path==='/api/boxes'&&req.method==='GET'){const {rows}=await query(`SELECT b.box_id AS "boxId",b.sku,b.quantity AS qty,p.name,b.status,b.received_at AS "receivedAt" FROM boxes b JOIN products p USING(sku) ORDER BY b.box_id`);return json(res,200,rows)}
     const boxMatch=path.match(/^\/api\/boxes\/([^/]+)$/);if(boxMatch&&req.method==='GET'){const {rows}=await query(`SELECT b.box_id AS "boxId",b.sku,b.quantity AS qty,p.name,b.status,b.received_at AS "receivedAt" FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1`,[boxMatch[1].toUpperCase()]);return rows[0]?json(res,200,rows[0]):json(res,404,{error:'Box not found'})}
@@ -81,10 +87,11 @@ const server=http.createServer(async(req,res)=>{
     if(path==='/api/scans'&&req.method==='POST'){
       const input=await body(req);if(!input)return json(res,400,{error:'Invalid JSON'});const boxId=String(input.boxId||'').trim().toUpperCase();if(!boxId)return json(res,400,{error:'boxId is required'});
       const client=await pool.connect();try{
-        await client.query('BEGIN');const found=await client.query('SELECT b.*,p.name FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1 FOR UPDATE',[boxId]);let box=found.rows[0];
+        await client.query('BEGIN');const scannedAt=new Date();const date=warehouseDateAt(scannedAt);const found=await client.query('SELECT b.*,p.name FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1 FOR UPDATE',[boxId]);let box=found.rows[0];
         if(!box){if(!input.sku||!Number.isInteger(input.qty)||input.qty<1){await client.query('ROLLBACK');return json(res,400,{error:'Unknown box; sku and positive integer qty are required'})}box=(await client.query(`INSERT INTO boxes(box_id,sku,quantity,status) VALUES($1,$2,$3,'pending') RETURNING *`,[boxId,String(input.sku).trim().toUpperCase(),input.qty])).rows[0]}
         const existing=await client.query(`SELECT box_id AS "boxId",sku,qty,location_number AS destination,scanned_at AS "scannedAt" FROM scan_events WHERE box_id=$1`,[boxId]);if(existing.rows[0]){await client.query('ROLLBACK');return json(res,409,{error:'Duplicate scan',previous:existing.rows[0]})}
-        const date=warehouseDate();const cycle=await openCycle(client,date,input.userId||'system');
+        const cycle=await openCycle(client,date,input.userId||'system','auto',scannedAt);
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`dockflow:assignments:${cycle.id}`]);
         const skuAssignments=(await client.query(`SELECT da.* FROM daily_assignments da WHERE da.cycle_id=$1 AND da.sku=$2 ORDER BY da.location_number FOR UPDATE`,[cycle.id,box.sku])).rows;
         let assignment=null;
         for(const candidate of skuAssignments){const filled=Number((await client.query(`SELECT COALESCE(SUM(qty),0)::int AS filled FROM scan_events WHERE cycle_id=$1 AND location_number=$2`,[cycle.id,candidate.location_number])).rows[0].filled);if(filled+box.quantity<=candidate.capacity){assignment=candidate;break}}
@@ -93,7 +100,7 @@ const server=http.createServer(async(req,res)=>{
           if(!next){await client.query(`INSERT INTO exceptions(box_id,reason,warehouse_date,user_id,device_id) VALUES($1,$2,$3,$4,$5)`,[boxId,'NO AVAILABLE SORTING LOCATION',date,input.userId||'unknown',input.deviceId||'unknown']);await client.query('COMMIT');return json(res,409,{error:'NO AVAILABLE SORTING LOCATION',exception:true})}
           assignment=(await client.query(`INSERT INTO daily_assignments(cycle_id,warehouse_date,sku,location_number,capacity,assigned_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[cycle.id,date,box.sku,next.location_number,next.capacity,input.userId||'system'])).rows[0];
         }
-        const event=(await client.query(`INSERT INTO scan_events(box_id,sku,qty,destination,location_number,warehouse_date,cycle_id,user_id,device_id,inbound_id,client_id,box_sequence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING box_id AS "boxId",sku,qty,location_number AS destination,warehouse_date AS "warehouseDate",scanned_at AS "scannedAt",user_id AS "userId",device_id AS "deviceId"`,[boxId,box.sku,box.quantity,`LOCATION ${assignment.location_number}`,assignment.location_number,date,cycle.id,input.userId||'unknown',input.deviceId||'unknown',input.inboundId||null,input.clientId||null,input.boxSequence||null])).rows[0];
+        const event=(await client.query(`INSERT INTO scan_events(box_id,sku,qty,destination,location_number,warehouse_date,cycle_id,user_id,device_id,inbound_id,client_id,box_sequence,scanned_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING box_id AS "boxId",sku,qty,location_number AS destination,warehouse_date AS "warehouseDate",scanned_at AS "scannedAt",user_id AS "userId",device_id AS "deviceId"`,[boxId,box.sku,box.quantity,`LOCATION ${assignment.location_number}`,assignment.location_number,date,cycle.id,input.userId||'unknown',input.deviceId||'unknown',input.inboundId||null,input.clientId||null,input.boxSequence||null,scannedAt])).rows[0];
         await client.query(`UPDATE boxes SET status='received',received_at=COALESCE(received_at,now()) WHERE box_id=$1`,[boxId]);await client.query('COMMIT');return json(res,201,event);
       }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Duplicate scan'});if(err.code==='23503')return json(res,400,{error:'SKU does not exist'});throw err}finally{client.release()}
     }
