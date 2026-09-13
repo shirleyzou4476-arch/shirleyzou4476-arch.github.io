@@ -16,6 +16,10 @@ self.addEventListener('activate',event=>event.waitUntil(caches.keys().then(keys=
 self.addEventListener('fetch',event=>{
   const request=event.request; const url=new URL(request.url);
   if(request.method!=='GET'||url.pathname.startsWith('/api/')||(url.origin!==self.location.origin&&!CDN_ORIGINS.has(url.origin)))return;
+  if(url.pathname==='/setup'||url.pathname==='/app.jsx'||url.pathname==='/sw.js'){
+    event.respondWith(fetch(request,{cache:'no-store'}));
+    return;
+  }
   if(request.mode==='navigate'){
     event.respondWith(fetch(request).then(response=>{const copy=response.clone();caches.open(VERSION).then(cache=>cache.put('/index.html',copy));return response}).catch(()=>caches.match('/index.html')));return;
   }
