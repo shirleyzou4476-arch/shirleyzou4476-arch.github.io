@@ -15,6 +15,17 @@ npm start
 # http://localhost:3000
 ```
 
+### Android warehouse PDA
+
+DockFlow is installable as a PWA over HTTPS (or `localhost` during development). On
+an Android PDA, open the service URL in Chrome, choose **Install app** / **Add to
+Home screen**, then open **PDA Scan**. Allow camera access to scan QR labels with
+the rear camera. If the camera is unavailable or permission is declined, enter a
+Box ID or the complete QR payload in the large manual field; it uses the same
+`POST /api/scans` path and therefore keeps duplicate, capacity, and exception
+semantics unchanged. The service worker caches only the application shell and
+never caches `/api/*` responses, so operational data remains live.
+
 The production warehouse timezone is fixed to **America/Chicago** in the API. It is never taken from the server timezone, UTC, or an environment override; the JavaScript `Intl` timezone database applies DST transitions automatically. `DATABASE_URL` is required for data APIs.
 
 ## Render + Neon deployment

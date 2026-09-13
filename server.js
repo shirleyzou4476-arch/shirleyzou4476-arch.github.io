@@ -1,5 +1,5 @@
 import http from 'node:http';
-import {readFile} from 'node:fs/promises';
+import {readFile,stat} from 'node:fs/promises';
 import {extname, join, normalize} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import pg from 'pg';
@@ -105,7 +105,15 @@ const server=http.createServer(async(req,res)=>{
       }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Duplicate scan'});if(err.code==='23503')return json(res,400,{error:'SKU does not exist'});throw err}finally{client.release()}
     }
     if(path.startsWith('/api/'))return json(res,404,{error:'Not found'});
-    const relative=path==='/'?'index.html':path.slice(1);const file=normalize(join(root,relative));if(!file.startsWith(root))return json(res,404,{error:'Not found'});const data=await readFile(file);const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.jsx':'text/javascript; charset=utf-8','.css':'text/css'};res.writeHead(200,{'content-type':types[extname(file)]||'application/octet-stream'});res.end(data);
+    const relative=path==='/'?'index.html':path.slice(1);const file=normalize(join(root,relative));
+    if(!file.startsWith(root))return json(res,404,{error:'Not found'});
+    let resolved=file;
+    try{if(!(await stat(resolved)).isFile())throw new Error('not a file')}catch{
+      // Client-side routes are served by the single-page app, but missing assets are real 404s.
+      if(path.includes('.')||req.method!=='GET')return json(res,404,{error:'Not found'});
+      resolved=join(root,'index.html');
+    }
+    const data=await readFile(resolved);const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.jsx':'text/javascript; charset=utf-8','.css':'text/css','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'};res.writeHead(200,{'content-type':types[extname(resolved)]||'application/octet-stream','cache-control':path.startsWith('/api/')?'no-store':'public, max-age=0, must-revalidate'});res.end(data);
   }catch(err){console.error(err);json(res,500,{error:'Internal server error'})}
 });
 if(process.argv[1]===fileURLToPath(import.meta.url)){if(!process.env.DATABASE_URL)console.error('DATABASE_URL is not set; API requests will return 503');server.listen(Number(process.env.PORT)||3000,()=>console.log(`DockFlow running on port ${process.env.PORT||3000}`))}
