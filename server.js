@@ -11,6 +11,20 @@ const json=(res,status,data)=>{res.writeHead(status,{'content-type':'application
 const body=async req=>{let raw='';for await(const chunk of req)raw+=chunk;try{return raw?JSON.parse(raw):{}}catch{return null}};
 const requireDb=(res)=>{if(!pool){json(res,503,{error:'DATABASE_URL is required for this API'});return false}return true};
 const query=sql=>pool.query(sql);
+export const validateLocationImport=(locations)=>{
+  const errors=[]; const seen=new Set();
+  if(!Array.isArray(locations)||!locations.length)return {errors:[{scope:'file',message:'The import must contain at least one location row.'}]};
+  locations.forEach((input,index)=>{
+    const row=index+2; const location=String(input?.location??'').trim().toUpperCase(); const sku=String(input?.SKU??input?.sku??'').trim().toUpperCase(); const capacity=String(input?.capacity??'').trim();
+    if(!location)errors.push({row,field:'location',message:'Location is required.'});
+    else if(seen.has(location))errors.push({row,field:'location',message:`Duplicate location code "${location}" in the file.`});
+    else seen.add(location);
+    if(!sku)errors.push({row,field:'SKU',message:'SKU is required.'});
+    const numeric=Number(capacity);
+    if(!capacity||!Number.isInteger(numeric)||numeric<=0)errors.push({row,field:'capacity',message:'Capacity must be a positive whole number.'});
+  });
+  return {errors,rows:locations.map(input=>({location:String(input?.location??'').trim().toUpperCase(),sku:String(input?.SKU??input?.sku??'').trim().toUpperCase(),capacity:Number(input?.capacity)}))};
+};
 const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost'); const path=url.pathname;
   if(req.method==='OPTIONS'){res.writeHead(204,{'access-control-allow-origin':url.origin,'access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'});return res.end()}
@@ -20,6 +34,27 @@ const server=http.createServer(async(req,res)=>{
     if(path==='/api/boxes'&&req.method==='GET'){const {rows}=await query(`SELECT b.box_id AS "boxId",b.sku,b.quantity AS qty,p.name,b.status,b.received_at AS "receivedAt" FROM boxes b JOIN products p USING(sku) ORDER BY b.box_id`);return json(res,200,rows)}
     const boxMatch=path.match(/^\/api\/boxes\/([^/]+)$/); if(boxMatch&&req.method==='GET'){const {rows}=await pool.query(`SELECT b.box_id AS "boxId",b.sku,b.quantity AS qty,p.name,b.status,b.received_at AS "receivedAt" FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1`,[boxMatch[1].toUpperCase()]);return rows[0]?json(res,200,rows[0]):json(res,404,{error:'Box not found'})}
     if(path==='/api/locations'&&req.method==='GET'){const {rows}=await query(`SELECT r.sku,r.location_code AS location,r.capacity,COALESCE(SUM(s.qty) FILTER (WHERE s.destination=r.location_code),0)::int AS filled FROM routing_rules r LEFT JOIN scan_events s ON s.destination=r.location_code GROUP BY r.id ORDER BY r.sku,r.priority`);return json(res,200,rows)}
+    if(path==='/api/locations/import'&&req.method==='POST'){
+      const input=await body(req); if(!input)return json(res,400,{error:'Invalid JSON'});
+      const validated=validateLocationImport(input.locations);
+      if(validated.errors.length)return json(res,422,{error:'Location import validation failed',errors:validated.errors});
+      const client=await pool.connect();
+      try{
+        await client.query('BEGIN');
+        if(input.replace===true){await client.query('DELETE FROM routing_rules');await client.query('DELETE FROM locations')}
+        const products=(await client.query('SELECT sku FROM products WHERE sku = ANY($1::text[])',[validated.rows.map(row=>row.sku)])).rows.map(row=>row.sku);
+        const missing=validated.rows.filter(row=>!products.includes(row.sku));
+        if(missing.length){await client.query('ROLLBACK');return json(res,422,{error:'Location import validation failed',errors:missing.map(row=>({row:validated.rows.indexOf(row)+2,field:'SKU',message:`SKU "${row.sku}" does not exist in products.`}))})}
+        const priorities=new Map();
+        for(const row of validated.rows){
+          const priority=(priorities.get(row.sku)||0)+1; priorities.set(row.sku,priority);
+          await client.query('INSERT INTO locations(code,capacity,sku) VALUES($1,$2,$3)',[row.location,row.capacity,row.sku]);
+          await client.query('INSERT INTO routing_rules(sku,priority,location_code,capacity) VALUES($1,$2,$3,$4)',[row.sku,priority,row.location,row.capacity]);
+        }
+        await client.query('COMMIT');
+        return json(res,201,{imported:validated.rows.length,replaced:input.replace===true});
+      }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Location codes must be unique and each SKU can only have one priority per route.'});throw err}finally{client.release()}
+    }
     if(path==='/api/history'&&req.method==='GET'){const q=(url.searchParams.get('q')||'').trim();const {rows}=await pool.query(`SELECT s.box_id AS "boxId",s.sku,s.qty,s.destination AS loc,s.user_id AS "userId",s.device_id AS "deviceId",s.scanned_at AS "scannedAt",p.name FROM scan_events s JOIN products p USING(sku) WHERE ($1='' OR s.box_id ILIKE '%'||$1||'%' OR s.sku ILIKE '%'||$1||'%') ORDER BY s.scanned_at DESC LIMIT 200`,[q]);return json(res,200,rows)}
     if(path==='/api/exceptions'&&req.method==='GET'){const {rows}=await query(`SELECT id,box_id AS box,reason,status,resolved_at AS "resolvedAt" FROM exceptions ORDER BY (status='open') DESC, created_at DESC`);return json(res,200,rows)}
     const exceptionMatch=path.match(/^\/api\/exceptions\/([^/]+)\/resolve$/);if(exceptionMatch&&req.method==='POST'){const {rows}=await pool.query(`UPDATE exceptions SET status='resolved',resolved_at=now() WHERE id=$1 RETURNING id,box_id AS box,reason,status,resolved_at AS "resolvedAt"`,[exceptionMatch[1]]);return rows[0]?json(res,200,rows[0]):json(res,404,{error:'Exception not found'})}

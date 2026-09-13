@@ -37,11 +37,14 @@ Alternatively run those two commands from Render's shell. Confirm `https://your-
 - `GET /api/boxes` and `/api/boxes/:boxId`
 - `POST /api/scans` with `{boxId, sku, qty, userId, deviceId, inboundId, clientId, boxSequence}`
 - `GET /api/locations`
+- `POST /api/locations/import` with `{replace, locations: [{location, SKU, capacity}]}`
 - `GET /api/history?q=BOX-...`
 - `GET /api/exceptions`
 - `POST /api/exceptions/:id/resolve`
 
 PostgreSQL's unique `scan_events(box_id)` constraint and the transactional row lock make duplicate scans return `409` safely under concurrency. `db/seed.sql` uses conflict-safe upserts and can be run repeatedly.
+
+The Locations page accepts a CSV with the exact header `location,SKU,capacity`. Imports are validated for required fields, positive whole-number capacity, duplicate location codes, and known products before PostgreSQL is changed. Selecting **Replace current locations** atomically replaces locations and rebuilds SKU routing priorities; clearing it adds routes to the existing configuration. Use **Download template** in the import dialog for a starter CSV. A failed import returns `422` with row-level errors and does not partially save.
 
 ## Tests
 
