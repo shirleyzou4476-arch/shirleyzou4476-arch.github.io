@@ -42,9 +42,27 @@ DATABASE_URL='your-neon-url' npm run db:seed
 
 5. Confirm `/api/health` reports `database: connected`, then open the service. If the current cycle must be restarted on the same local date, an administrator uses **Start New Day / Reset** and confirms the screen. Automatic rollover creates a new cycle on the next America/Chicago date. The migration adds cycle provenance (`started_by`, `start_mode`) and never deletes historical scans, assignments, boxes, or exceptions.
 
+### First administrator setup on Render Free
+
+The first administrator is created through a one-time HTTPS setup page; `DATABASE_URL` and the administrator password never go in chat, source control, a URL, or application logs.
+
+1. Generate a high-entropy token **locally** without printing any existing secret:
+
+   ```bash
+   openssl rand -base64 32
+   ```
+
+   Copy the generated value directly into the next Render field. To generate a password locally without echoing it, use `read -r -s ADMIN_PASSWORD; echo` in a terminal, then discard the shell variable after use.
+2. In the Render dashboard, open the DockFlow web service, select **Environment**, click **Add Environment Variable**, set key `DOCKFLOW_SETUP_TOKEN`, paste the generated token as its value, and click **Save Changes**. Keep `DATABASE_URL` and `NODE_ENV=production` as existing environment variables; never paste either value into chat.
+3. Click **Manual Deploy** → **Deploy latest commit** and wait for the deploy to become live. Render's HTTPS URL is the only supported production setup URL.
+4. Open `https://YOUR-RENDER-SERVICE.onrender.com/setup`. Enter the setup token in the first field, an administrator email, and a unique 12+ character password. Click **Create administrator**. The token is sent in an HTTPS request header and the password in the HTTPS request body; neither is placed in the URL.
+5. Confirm the success page, click **Go to sign in**, and sign in at the normal service URL. Verify the `admin` role, then create a worker and manager from **Users** and verify logout/login.
+6. In Render **Environment**, remove `DOCKFLOW_SETUP_TOKEN` and click **Save Changes**, then deploy again. The setup endpoint is also permanently disabled after the first active admin is created by the database-backed `admin_bootstrap` state. If an active admin already exists, the page returns the same generic setup error and cannot create or replace one.
+
+If the token is mistyped, setup is attempted over HTTP, or the endpoint receives too many attempts, it returns a generic error. The endpoint allows five attempts per client address per 15 minutes, compares tokens in constant time, uses a transaction lock, and never logs submitted credentials.
+
 ### Post-deployment authentication checklist
 
-- Run `npm run db:create-admin -- admin@example.com 'a unique 12+ character password'` against the production `DATABASE_URL` once.
 - Sign in from the Render URL, verify the admin role is shown, create one worker and one manager, and verify logout/login.
 - Verify a worker can receive and use PDA Scan, Locations, and Exceptions, but receives 403 from `/api/history`, `/api/archive`, `/api/day/reset`, and `/api/users`.
 - Verify the admin can change roles, reset a password, disable/reactivate users, and cannot disable or demote the last active admin.
@@ -79,10 +97,4 @@ npm test
 
 All API and application routes (except `/api/health` and login) require a database-backed session. Passwords are bcrypt-hashed, sessions are short-lived and stored as hashes, and the browser receives an HttpOnly SameSite cookie (Secure in production). State-changing requests are same-origin checked. Roles are exactly `admin`, `manager`, and `worker`: administrators have full access; managers can operate receiving, exceptions, history, archive and reports but cannot manage users or reset a day; workers are limited to Receiving, PDA Scan, Locations and Exceptions. Unauthorized direct URLs and API calls return 401/403.
 
-After `npm run db:schema`, create the first administrator without placing a password in source control:
-
-```bash
-DATABASE_URL='your-neon-url' npm run db:create-admin -- admin@example.com 'use-a-long-password-here'
-```
-
-Run the schema migration before starting a deployment and periodically clean expired sessions (login also performs cleanup; `DELETE FROM sessions WHERE expires_at <= now()` is safe to schedule). The administrator Users page can create and disable accounts, while preventing removal or demotion of the last active administrator.
+Run the schema migration before starting a deployment and periodically clean expired sessions (login also performs cleanup; `DELETE FROM sessions WHERE expires_at <= now()` is safe to schedule). The administrator Users page can create and disable accounts, while preventing removal or demotion of the last active administrator. The legacy `db:create-admin` script remains available for controlled local recovery, but the Render production path is the one-time `/setup` flow above.
