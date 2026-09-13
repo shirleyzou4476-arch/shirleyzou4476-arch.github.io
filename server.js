@@ -27,7 +27,13 @@ const server=http.createServer(async(req,res)=>{
       const input=await body(req);if(!input)return json(res,400,{error:'Invalid JSON'});const boxId=String(input.boxId||'').trim().toUpperCase();if(!boxId)return json(res,400,{error:'boxId is required'});
       const client=await pool.connect();try{await client.query('BEGIN');const found=await client.query('SELECT b.*,p.name FROM boxes b JOIN products p USING(sku) WHERE b.box_id=$1 FOR UPDATE',[boxId]);let box=found.rows[0];if(!box){if(!input.sku||!Number.isInteger(input.qty)||input.qty<1) {await client.query('ROLLBACK');return json(res,400,{error:'Unknown box; sku and positive integer qty are required'})}const inserted=await client.query(`INSERT INTO boxes(box_id,sku,quantity,status) VALUES($1,$2,$3,'pending') RETURNING *`,[boxId,String(input.sku).toUpperCase(),input.qty]);box=inserted.rows[0]}
         const existing=await client.query(`SELECT box_id AS "boxId",sku,qty,destination,scanned_at AS "scannedAt" FROM scan_events WHERE box_id=$1`,[boxId]);if(existing.rows[0]){await client.query('ROLLBACK');return json(res,409,{error:'Duplicate scan',previous:existing.rows[0]})}
-        const destination=(await client.query(`SELECT r.location_code FROM routing_rules r WHERE r.sku=$1 AND r.active=true ORDER BY r.priority LIMIT 1`,[box.sku])).rows[0]?.location_code||'OVERFLOW';
+        const routes=(await client.query(`SELECT r.location_code,r.capacity,
+          COALESCE((SELECT SUM(s.qty) FROM scan_events s WHERE s.destination=r.location_code),0)::int AS filled
+          FROM routing_rules r
+          WHERE r.sku=$1 AND r.active=true
+          ORDER BY r.priority
+          FOR UPDATE`,[box.sku])).rows;
+        const destination=(routes.find(route=>route.filled+box.quantity<=route.capacity)||routes.find(route=>route.filled<route.capacity))?.location_code||'OVERFLOW';
         const event=(await client.query(`INSERT INTO scan_events(box_id,sku,qty,destination,user_id,device_id,inbound_id,client_id,box_sequence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING box_id AS "boxId",sku,qty,destination,scanned_at AS "scannedAt",user_id AS "userId",device_id AS "deviceId"`,[boxId,box.sku,box.quantity,destination,input.userId||'unknown',input.deviceId||'unknown',input.inboundId||null,input.clientId||null,input.boxSequence||null])).rows[0];await client.query(`UPDATE boxes SET status='received',received_at=COALESCE(received_at,now()) WHERE box_id=$1`,[boxId]);await client.query('COMMIT');return json(res,201,event);
       }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Duplicate scan'});if(err.code==='23503')return json(res,400,{error:'SKU does not exist'});throw err}finally{client.release()}
     }
