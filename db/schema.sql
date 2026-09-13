@@ -14,6 +14,12 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS users_role_idx ON users(role);
+CREATE TABLE IF NOT EXISTS admin_bootstrap (
+  id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+  consumed_at TIMESTAMPTZ,
+  consumed_by UUID REFERENCES users(id)
+);
+INSERT INTO admin_bootstrap(id) VALUES (true) ON CONFLICT (id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS sessions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

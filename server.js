@@ -4,7 +4,7 @@ import {extname, join, normalize} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import pg from 'pg';
 import bcrypt from 'bcryptjs';
-import {randomBytes,createHash} from 'node:crypto';
+import {randomBytes,createHash,timingSafeEqual} from 'node:crypto';
 
 const {Pool}=pg;
 const root=fileURLToPath(new URL('.',import.meta.url));
@@ -12,6 +12,8 @@ export const MAX_SORTING_LOCATIONS=50;
 export const WAREHOUSE_TIME_ZONE='America/Chicago';
 export const pool=process.env.DATABASE_URL?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:undefined}):null;
 const SESSION_DAYS=7;
+const BOOTSTRAP_WINDOW_MS=15*60*1000;
+const bootstrapAttempts=new Map();
 if(pool){const cleanup=setInterval(()=>pool.query('DELETE FROM sessions WHERE expires_at<=now()').catch(()=>{}),60*60*1000);cleanup.unref?.()}
 const json=(res,status,data)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))};
 const cookieName='dockflow_session';
@@ -19,6 +21,19 @@ const parseCookies=req=>Object.fromEntries((req.headers.cookie||'').split(';').f
 const setCookie=(res,value,maxAge=SESSION_DAYS*86400)=>res.setHeader('set-cookie',`${cookieName}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${process.env.NODE_ENV==='production'?'; Secure':''}`);
 const clearCookie=res=>setCookie(res,'',0);
 const tokenHash=token=>createHash('sha256').update(token).digest('hex');
+const sameToken=(provided,configured)=>{
+  const providedHash=Buffer.from(tokenHash(provided),'hex');
+  const configuredHash=Buffer.from(tokenHash(configured),'hex');
+  return timingSafeEqual(providedHash,configuredHash);
+};
+const requestIsHttps=req=>req.socket.encrypted===true||String(req.headers['x-forwarded-proto']||'').split(',')[0].trim()==='https';
+const clientAddress=req=>String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',')[0].trim();
+const bootstrapAllowed=(req)=>{
+  const now=Date.now();const key=clientAddress(req);const previous=bootstrapAttempts.get(key);
+  if(!previous||now-previous.startedAt>=BOOTSTRAP_WINDOW_MS){bootstrapAttempts.set(key,{startedAt:now,count:1});return true}
+  previous.count+=1;return previous.count<=5;
+};
+const bootstrapError=res=>json(res,403,{error:'Setup unavailable'});
 async function sessionUser(req,res){
   if(!pool)return null;
   const token=parseCookies(req)[cookieName];if(!token)return null;
@@ -80,6 +95,31 @@ const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost');const path=url.pathname;
   if(req.method==='OPTIONS'){res.writeHead(204,{'access-control-allow-origin':url.origin,'access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'});return res.end()}
   if(path==='/api/health'){if(!pool)return json(res,200,{ok:true,service:'dockflow',database:'not configured'});try{await query('SELECT 1');return json(res,200,{ok:true,service:'dockflow',database:'connected'})}catch{return json(res,503,{ok:false,service:'dockflow',database:'unavailable'})}}
+  if(path==='/api/auth/bootstrap'&&req.method==='POST'){
+    if(!pool)return bootstrapError(res);
+    if(process.env.NODE_ENV==='production'&&!requestIsHttps(req))return bootstrapError(res);
+    if(!bootstrapAllowed(req))return json(res,429,{error:'Setup unavailable'});
+    const configuredToken=process.env.DOCKFLOW_SETUP_TOKEN;
+    const providedToken=String(req.headers['x-dockflow-setup-token']||'');
+    if(!configuredToken||configuredToken.length<32||!providedToken||!sameToken(providedToken,configuredToken))return bootstrapError(res);
+    if(!sameOrigin(req))return bootstrapError(res);
+    const input=await body(req);const email=String(input?.email||'').trim().toLowerCase();const passcode=String(input?.password||'');
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||passcode.length<12)return bootstrapError(res);
+    const client=await pool.connect();
+    try{
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',['dockflow:admin-bootstrap']);
+      const state=(await client.query('SELECT consumed_at FROM admin_bootstrap WHERE id=true FOR UPDATE')).rows[0];
+      const activeAdmin=(await client.query(`SELECT 1 FROM users WHERE role='admin' AND active LIMIT 1`)).rows[0];
+      if(!state||state.consumed_at||activeAdmin){await client.query('ROLLBACK');return bootstrapError(res)}
+      const hash=await bcrypt.hash(passcode,12);
+      const created=(await client.query(`INSERT INTO users(email,password_hash,role) VALUES($1,$2,'admin') RETURNING id`,[email,hash])).rows[0];
+      await client.query('UPDATE admin_bootstrap SET consumed_at=now(),consumed_by=$1 WHERE id=true',[created.id]);
+      await client.query('COMMIT');
+      bootstrapAttempts.delete(clientAddress(req));
+      return json(res,201,{ok:true});
+    }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return bootstrapError(res);throw err}finally{client.release()}
+  }
   if(path.startsWith('/api/')&&!requireDb(res))return;
   try{
     if(path==='/api/auth/login'&&req.method==='POST'){
@@ -178,6 +218,7 @@ const server=http.createServer(async(req,res)=>{
       }catch(err){await client.query('ROLLBACK');if(err.code==='23505')return json(res,409,{error:'Duplicate scan'});if(err.code==='23503')return json(res,400,{error:'SKU does not exist'});throw err}finally{client.release()}
     }
     if(path.startsWith('/api/'))return json(res,404,{error:'Not found'});
+    if(path==='/setup'&&process.env.NODE_ENV==='production'&&!requestIsHttps(req))return bootstrapError(res);
     const relative=path==='/'?'index.html':path.slice(1);const file=normalize(join(root,relative));
     if(!file.startsWith(root))return json(res,404,{error:'Not found'});
     let resolved=file;
@@ -186,7 +227,7 @@ const server=http.createServer(async(req,res)=>{
       if(path.includes('.')||req.method!=='GET')return json(res,404,{error:'Not found'});
       resolved=join(root,'index.html');
     }
-    const data=await readFile(resolved);const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.jsx':'text/javascript; charset=utf-8','.css':'text/css','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'};res.writeHead(200,{'content-type':types[extname(resolved)]||'application/octet-stream','cache-control':path.startsWith('/api/')?'no-store':'public, max-age=0, must-revalidate'});res.end(data);
+    const data=await readFile(resolved);const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.jsx':'text/javascript; charset=utf-8','.css':'text/css','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'};res.writeHead(200,{'content-type':types[extname(resolved)]||'application/octet-stream','cache-control':path==='/setup'||path.startsWith('/api/')?'no-store':'public, max-age=0, must-revalidate'});res.end(data);
   }catch(err){console.error(err);json(res,500,{error:'Internal server error'})}
 });
 if(process.argv[1]===fileURLToPath(import.meta.url)){if(!process.env.DATABASE_URL)console.error('DATABASE_URL is not set; API requests will return 503');server.listen(Number(process.env.PORT)||3000,()=>console.log(`DockFlow running on port ${process.env.PORT||3000}`))}
