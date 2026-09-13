@@ -15,7 +15,7 @@ The browser demo works offline from the UI after the initial CDN load. Use **BOX
 
 ## API
 
-`GET /api/health`, `GET /api/boxes`, and `GET /api/boxes/:boxId` are included. The frontend deliberately defaults to local demo data so it remains usable on a static host.
+`GET /api/health`, `GET /api/boxes`, and `GET /api/boxes/:boxId` are included. `POST /api/scans` accepts `{boxId, sku, qty, userId, deviceId, inboundId, clientId, boxSequence}` and returns `409` with the prior event for duplicate boxes. The frontend deliberately defaults to local demo data so it remains usable on a static host.
 
 ## PostgreSQL
 
